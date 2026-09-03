@@ -602,6 +602,27 @@
         </div>
     </div>
 
+    <!-- 刪除確認 Modal (取代原生 confirm，符合安全無阻規範) -->
+    <div id="delete-confirm-modal" class="hidden fixed inset-0 z-50 overflow-y-auto flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
+        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-100 transform transition-all-300 text-center">
+            <div class="w-12 h-12 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center text-xl mx-auto mb-3 border border-rose-100">
+                <i class="fa-solid fa-trash-can"></i>
+            </div>
+            <h3 class="text-base font-bold text-slate-800">確認刪除報名資料</h3>
+            <p class="text-xs text-slate-500 mt-2 leading-relaxed">
+                確定要刪除「<span id="delete-target-name" class="font-bold text-slate-800"></span>」的資料嗎？此操作將會從清單中移除且無法復原。
+            </p>
+            <div class="flex space-x-2 pt-5">
+                <button type="button" onclick="closeDeleteModal()" class="w-1/2 py-2 rounded-lg border border-slate-200 text-slate-600 font-medium text-xs hover:bg-slate-50 transition-all-300">
+                    取消
+                </button>
+                <button type="button" onclick="executeDeleteRegistrant()" class="w-1/2 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs transition-all-300 shadow-sm">
+                    確認刪除
+                </button>
+            </div>
+        </div>
+    </div>
+
     <!-- 研究者後台管理主頁面 -->
     <div id="admin-panel" class="hidden fixed inset-0 z-50 overflow-y-auto bg-slate-50">
         <header class="bg-white border-b border-slate-200/80 sticky top-0 z-10 px-4 py-4 shadow-sm">
@@ -723,7 +744,7 @@
         // 導入 Firebase 核心和服務
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, doc, deleteDoc, addDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // 本機安全儲存鍵名
         const LOCAL_STORAGE_KEY = 'thesis_study_registrations_v1';
@@ -756,6 +777,7 @@
         let auth = null;
         let isCloudAvailable = false;
         let lastSubmittedData = null; // 用於在成功畫面給 AI 快速讀取背景
+        let pendingDeleteId = null; // 待刪除項目 ID
 
         const apiKey = ""; 
 
@@ -1239,13 +1261,57 @@
                         </td>
                         <td class="p-4 text-xs text-slate-400 font-mono">${reg.createdAt}</td>
                         <td class="p-4 text-center">
-                            <button onclick="viewRegDetails('${reg.id}')" class="px-2.5 py-1 bg-brand-100 text-brand-700 rounded text-xs hover:bg-brand-200 transition-all-300 font-medium">
-                                <i class="fa-solid fa-circle-info mr-0.5"></i>詳情
-                            </button>
+                            <div class="flex items-center justify-center space-x-1.5">
+                                <button onclick="viewRegDetails('${reg.id}')" class="px-2.5 py-1 bg-brand-100 text-brand-700 rounded text-xs hover:bg-brand-200 transition-all-300 font-medium">
+                                    <i class="fa-solid fa-circle-info mr-0.5"></i>詳情
+                                </button>
+                                <button onclick="promptDeleteRegistrant('${reg.id}')" class="px-2.5 py-1 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded text-xs transition-all-300 font-medium border border-rose-200/60" title="刪除此筆資料">
+                                    <i class="fa-solid fa-trash-can mr-0.5"></i>刪除
+                                </button>
+                            </div>
                         </td>
                     </tr>
                 `;
             }).join('');
+        }
+
+        // 刪除操作邏輯
+        function promptDeleteRegistrant(id) {
+            const target = registrants.find(r => r.id === id);
+            if (!target) return;
+            pendingDeleteId = id;
+            const nameEl = document.getElementById('delete-target-name');
+            if (nameEl) nameEl.innerText = target.name || '該報名者';
+            document.getElementById('delete-confirm-modal')?.classList.remove('hidden');
+        }
+
+        function closeDeleteModal() {
+            pendingDeleteId = null;
+            document.getElementById('delete-confirm-modal')?.classList.add('hidden');
+        }
+
+        async function executeDeleteRegistrant() {
+            if (!pendingDeleteId) return;
+            const targetId = pendingDeleteId;
+            closeDeleteModal();
+
+            // 1. 本機資料庫刪除
+            registrants = registrants.filter(r => r.id !== targetId);
+            saveLocalRegistrations(registrants);
+            renderAdminData();
+
+            // 2. 雲端資料庫同步刪除（若已連線）
+            if (isCloudAvailable && currentUser && db) {
+                try {
+                    const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'seminar-registration-app';
+                    const docRef = doc(db, 'artifacts', currentAppId, 'public', 'data', 'registrations', targetId);
+                    await deleteDoc(docRef);
+                } catch (e) {
+                    console.warn("雲端刪除略過或已在本地移除:", e);
+                }
+            }
+
+            showToast("已成功刪除該筆報名資料！");
         }
 
         // 新增模擬測試資料
@@ -1436,6 +1502,9 @@
         window.addMockSubmission = addMockSubmission;
         window.generateAISupport = generateAISupport;
         window.generateAIInterviewGuide = generateAIInterviewGuide;
+        window.promptDeleteRegistrant = promptDeleteRegistrant;
+        window.closeDeleteModal = closeDeleteModal;
+        window.executeDeleteRegistrant = executeDeleteRegistrant;
 
         window.onload = function() {
             // 初始化渲染名單
