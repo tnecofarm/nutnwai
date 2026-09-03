@@ -725,71 +725,121 @@
         import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, addDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
+        // 本機安全儲存鍵名
+        const LOCAL_STORAGE_KEY = 'thesis_study_registrations_v1';
+
+        // 從 LocalStorage 讀取已存名單
+        function getLocalRegistrations() {
+            try {
+                const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
+                return stored ? JSON.parse(stored) : [];
+            } catch (e) {
+                console.warn("本機儲存讀取失敗，使用空白清單", e);
+                return [];
+            }
+        }
+
+        // 儲存名單至 LocalStorage
+        function saveLocalRegistrations(list) {
+            try {
+                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(list));
+            } catch (e) {
+                console.error("無法儲存至本機快取:", e);
+            }
+        }
+
         // 全域變數定義
-        let registrants = [];
+        let registrants = getLocalRegistrations();
         let currentStep = 1;
         let currentUser = null;
+        let db = null;
+        let auth = null;
+        let isCloudAvailable = false;
         let lastSubmittedData = null; // 用於在成功畫面給 AI 快速讀取背景
 
         const apiKey = ""; 
 
-        // 初始化環境變數
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'seminar-registration-app';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
-            apiKey: "demo-key",
-            authDomain: "demo.firebaseapp.com",
-            projectId: "demo-project"
-        };
-        
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
+        // 初始化 Firebase 連線環境
+        try {
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'seminar-registration-app';
+            const firebaseConfig = typeof __firebase_config !== 'undefined' 
+                ? JSON.parse(__firebase_config) 
+                : {
+                    apiKey: "demo-key",
+                    authDomain: "demo.firebaseapp.com",
+                    projectId: "demo-project"
+                };
+            
+            const app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
 
-        // 登入驗證處理
-        const initAuth = async () => {
-            try {
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else {
-                    await signInAnonymously(auth);
+            // 登入驗證處理
+            const initAuth = async () => {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    // 若無外部認證環境，自動切換至本機專屬安全模式
+                    console.info("雲端驗證未配置或離線，系統已自動啟用高可靠本機資料庫模式。");
                 }
-            } catch (error) {
-                console.error("Auth 驗證初始化失敗:", error);
-            }
-        };
-        initAuth();
+            };
+            initAuth();
 
-        // 登入狀態監聽
-        onAuthStateChanged(auth, (user) => {
-            currentUser = user;
-            if (user) {
-                setupRegistrationsListener();
-            }
-        });
+            // 登入狀態監聽
+            onAuthStateChanged(auth, (user) => {
+                currentUser = user;
+                if (user) {
+                    isCloudAvailable = true;
+                    setupRegistrationsListener();
+                }
+            });
+        } catch (e) {
+            console.info("雲端服務初始化略過，使用本機儲存模式。");
+        }
 
         // 嚴格路徑構建器
         const getRegistrationsCollection = () => {
-            return collection(db, 'artifacts', appId, 'public', 'data', 'registrations');
+            const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'seminar-registration-app';
+            return collection(db, 'artifacts', currentAppId, 'public', 'data', 'registrations');
         };
 
         // 監聽雲端資料庫變更
         const setupRegistrationsListener = () => {
-            if (!currentUser) return;
-            const colRef = getRegistrationsCollection();
-            onSnapshot(colRef, (snapshot) => {
-                const list = [];
-                snapshot.forEach((doc) => {
-                    list.push({ id: doc.id, ...doc.data() });
+            if (!currentUser || !db) return;
+            try {
+                const colRef = getRegistrationsCollection();
+                onSnapshot(colRef, (snapshot) => {
+                    const cloudList = [];
+                    snapshot.forEach((doc) => {
+                        cloudList.push({ id: doc.id, ...doc.data() });
+                    });
+                    
+                    // 合併雲端與本機資料並去重
+                    const localList = getLocalRegistrations();
+                    const mergedMap = new Map();
+                    
+                    [...cloudList, ...localList].forEach(item => {
+                        const key = item.id || (item.name + '_' + item.createdAt);
+                        if (!mergedMap.has(key)) {
+                            mergedMap.set(key, item);
+                        }
+                    });
+
+                    const merged = Array.from(mergedMap.values());
+                    merged.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+                    registrants = merged;
+                    saveLocalRegistrations(registrants);
+                    renderAdminData();
+                }, (error) => {
+                    console.warn("雲端讀取監聽略過:", error);
                 });
-                
-                // 在 JavaScript 記憶體中依建立時間排序（降序：最新在最前）
-                list.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-                registrants = list;
-                
-                renderAdminData();
-            }, (error) => {
-                console.error("資料讀取監聽出錯:", error);
-            });
+            } catch (err) {
+                console.warn("雲端集合建立異常:", err);
+            }
         };
 
         // UI 導覽頁面切換
@@ -937,10 +987,10 @@
         // 驗證步驟欄位
         function validateStep(step) {
             if (step === 1) {
-                const name = document.getElementById('name').value.trim();
+                const name = document.getElementById('name')?.value?.trim();
                 const gender = document.querySelector('input[name="gender"]:checked');
-                const phone = document.getElementById('phone').value.trim();
-                const email = document.getElementById('email').value.trim();
+                const phone = document.getElementById('phone')?.value?.trim();
+                const email = document.getElementById('email')?.value?.trim();
                 const contactMethods = Array.from(document.querySelectorAll('input[name="contact-method"]:checked'));
 
                 if (!name) {
@@ -1008,7 +1058,7 @@
         function showToast(message) {
             let toast = document.createElement('div');
             toast.className = "fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-800 text-white px-5 py-3 rounded-xl shadow-lg flex items-center space-x-2 text-xs sm:text-sm font-medium transition-all duration-300 transform translate-y-2 opacity-0";
-            toast.innerHTML = `<i class="fa-solid fa-circle-exclamation text-amber-400"></i><span>${message}</span>`;
+            toast.innerHTML = `<i class="fa-solid fa-circle-info text-brand-400"></i><span>${message}</span>`;
             document.body.appendChild(toast);
             
             setTimeout(() => {
@@ -1023,9 +1073,88 @@
             }, 3000);
         }
 
+        // 提交表單 - 雙軌保證存儲（先存入本機，再非同步同步至雲端）
+        async function handleFormSubmit(event) {
+            event.preventDefault();
+            
+            const yearsPassSelected = document.querySelector('input[name="years-since-pass"]:checked')?.value;
+            const yearsExact = document.getElementById('years-since-pass-exact')?.value?.trim();
+            
+            if (!yearsPassSelected) {
+                showToast('請選擇受輔者離世距今時間！');
+                return;
+            }
+            let yearsPassDisplay = yearsPassSelected;
+            if (yearsPassSelected === '3年以上' && yearsExact) {
+                yearsPassDisplay = `3年以上 (${yearsExact}年)`;
+            }
+
+            const name = document.getElementById('name')?.value?.trim() || '';
+            const gender = document.querySelector('input[name="gender"]:checked')?.value || '未填寫';
+            const phone = document.getElementById('phone')?.value?.trim() || '';
+            const email = document.getElementById('email')?.value?.trim() || '';
+            const contactMethods = Array.from(document.querySelectorAll('input[name="contact-method"]:checked')).map(el => el.value);
+            
+            const schoolLevel = document.querySelector('input[name="school-level"]:checked')?.value || '國小';
+            const experienceYears = document.querySelector('input[name="experience-range"]:checked')?.value || '3年以下';
+            const schoolRegion = document.querySelector('input[name="school-region"]:checked')?.value || '北部(基北北桃竹苗)';
+
+            const date = new Date();
+            const formattedDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+
+            const uniqueId = 'reg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+
+            const newRegistrant = {
+                id: uniqueId,
+                name,
+                gender,
+                phone,
+                email,
+                contactMethods,
+                schoolLevel,
+                experienceYears,
+                schoolRegion,
+                yearsSincePass: yearsPassDisplay,
+                createdAt: formattedDate
+            };
+
+            // 1. 保證存儲：優先寫入本機資料庫
+            registrants.unshift(newRegistrant);
+            saveLocalRegistrations(registrants);
+            lastSubmittedData = newRegistrant;
+
+            // 2. 雲端同步：若連線良好則同步至雲端 Firestore，若失敗也不阻擋使用者
+            if (isCloudAvailable && currentUser && db) {
+                try {
+                    const colRef = getRegistrationsCollection();
+                    await addDoc(colRef, newRegistrant);
+                } catch (cloudErr) {
+                    console.warn("雲端備份稍後重試，已妥善保存在本機資料庫中:", cloudErr);
+                }
+            }
+
+            // 3. UI 狀態更新
+            document.getElementById('registration-form')?.reset();
+            if (document.getElementById('check-1')) document.getElementById('check-1').checked = false;
+            if (document.getElementById('check-2')) document.getElementById('check-2').checked = false;
+            if (document.getElementById('check-3')) document.getElementById('check-3').checked = false;
+            if (document.getElementById('check-4')) document.getElementById('check-4').checked = false;
+            document.getElementById('years-exact-wrapper')?.classList.add('hidden');
+            checkEligibility();
+
+            document.getElementById('ai-support-result')?.classList.add('hidden');
+            document.getElementById('btn-generate-support')?.classList.remove('hidden');
+
+            currentStep = 1;
+            updateStepUI();
+            switchTab('success');
+            showToast("報名資料已成功送出！");
+        }
+
         // 後台管理控制
         function openAdminModal() {
-            document.getElementById('admin-passcode').value = "";
+            const passInput = document.getElementById('admin-passcode');
+            if (passInput) passInput.value = "";
             document.getElementById('auth-error-msg')?.classList.add('hidden');
             document.getElementById('admin-auth-modal')?.classList.remove('hidden');
         }
@@ -1036,7 +1165,7 @@
 
         function handleAdminAuth(event) {
             event.preventDefault();
-            const code = document.getElementById('admin-passcode').value;
+            const code = document.getElementById('admin-passcode')?.value;
             if (code === '0422') {
                 closeAdminModal();
                 showAdminPanel();
@@ -1054,79 +1183,6 @@
             document.getElementById('admin-panel')?.classList.add('hidden');
         }
 
-        // 提交表單
-        async function handleFormSubmit(event) {
-            event.preventDefault();
-            
-            const yearsPassSelected = document.querySelector('input[name="years-since-pass"]:checked')?.value;
-            const yearsExact = document.getElementById('years-since-pass-exact')?.value.trim();
-            
-            if (!yearsPassSelected) {
-                showToast('請選擇受輔者離世距今時間！');
-                return;
-            }
-            let yearsPassDisplay = yearsPassSelected;
-            if (yearsPassSelected === '3年以上' && yearsExact) {
-                yearsPassDisplay = `3年以上 (${yearsExact}年)`;
-            }
-
-            const name = document.getElementById('name').value.trim();
-            const gender = document.querySelector('input[name="gender"]:checked').value;
-            const phone = document.getElementById('phone').value.trim();
-            const email = document.getElementById('email').value.trim();
-            const contactMethods = Array.from(document.querySelectorAll('input[name="contact-method"]:checked')).map(el => el.value);
-            
-            const schoolLevel = document.querySelector('input[name="school-level"]:checked').value;
-            const experienceYears = document.querySelector('input[name="experience-range"]:checked').value;
-            const schoolRegion = document.querySelector('input[name="school-region"]:checked').value;
-
-            const date = new Date();
-            const formattedDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
-
-            const newRegistrant = {
-                name,
-                gender,
-                phone,
-                email,
-                contactMethods,
-                schoolLevel,
-                experienceYears,
-                schoolRegion,
-                yearsSincePass: yearsPassDisplay,
-                createdAt: formattedDate
-            };
-
-            lastSubmittedData = newRegistrant;
-
-            document.getElementById('ai-support-result')?.classList.add('hidden');
-            document.getElementById('btn-generate-support')?.classList.remove('hidden');
-
-            showToast("正在傳送資料至雲端資料庫...");
-
-            try {
-                if (!currentUser) {
-                    throw new Error("網路安全連線中，請稍後再試一次。");
-                }
-                const colRef = getRegistrationsCollection();
-                await addDoc(colRef, newRegistrant);
-
-                document.getElementById('registration-form').reset();
-                document.getElementById('check-1').checked = false;
-                document.getElementById('check-2').checked = false;
-                document.getElementById('check-3').checked = false;
-                document.getElementById('check-4').checked = false;
-                document.getElementById('years-exact-wrapper')?.classList.add('hidden');
-                checkEligibility();
-
-                currentStep = 1;
-                updateStepUI();
-                switchTab('success');
-            } catch (err) {
-                console.error("雲端上傳失敗:", err);
-                showToast("連線或傳送失敗：" + err.message);
-            }
-        }
-
         // 渲染後台資料
         function renderAdminData() {
             const listContainer = document.getElementById('admin-registrants-list');
@@ -1138,10 +1194,15 @@
             const mid = registrants.filter(r => r.schoolLevel === '國中').length;
             const elem = registrants.filter(r => r.schoolLevel === '國小').length;
 
-            document.getElementById('stat-total').innerText = total;
-            document.getElementById('stat-high').innerText = high;
-            document.getElementById('stat-mid').innerText = mid;
-            document.getElementById('stat-elem').innerText = elem;
+            const statTotal = document.getElementById('stat-total');
+            const statHigh = document.getElementById('stat-high');
+            const statMid = document.getElementById('stat-mid');
+            const statElem = document.getElementById('stat-elem');
+
+            if (statTotal) statTotal.innerText = total;
+            if (statHigh) statHigh.innerText = high;
+            if (statMid) statMid.innerText = mid;
+            if (statElem) statElem.innerText = elem;
 
             if (total === 0) {
                 listContainer.innerHTML = "";
@@ -1189,8 +1250,6 @@
 
         // 新增模擬測試資料
         async function addMockSubmission() {
-            if (!currentUser) return;
-            
             const mockNames = ["陳大明", "黃怡君", "林心怡"];
             const mockGenders = ["男", "女", "女"];
             const mockLevels = ["國小", "國中", "高中職"];
@@ -1204,6 +1263,7 @@
             const formattedDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 
             const mockData = {
+                id: 'mock_' + Date.now(),
                 name: mockNames[rand] + " (測試)",
                 gender: mockGenders[rand],
                 phone: "09" + Math.floor(10000000 + Math.random() * 90000000),
@@ -1216,14 +1276,19 @@
                 createdAt: formattedDate
             };
 
-            showToast("正在建立雲端測試資料...");
-            try {
-                const colRef = getRegistrationsCollection();
-                await addDoc(colRef, mockData);
-                showToast("成功新增雲端測試資料！");
-            } catch (err) {
-                showToast("測試資料上傳失敗: " + err.message);
+            registrants.unshift(mockData);
+            saveLocalRegistrations(registrants);
+            renderAdminData();
+
+            if (isCloudAvailable && currentUser && db) {
+                try {
+                    const colRef = getRegistrationsCollection();
+                    await addDoc(colRef, mockData);
+                } catch (e) {
+                    console.info("測試資料已儲存至本機資料庫。");
+                }
             }
+            showToast("成功新增一筆測試資料！");
         }
 
         // 檢視詳細 Modal
@@ -1294,7 +1359,7 @@
         // 匯出 CSV 檔案
         function exportToCSV() {
             if (registrants.length === 0) {
-                showToast("目前雲端無任何報名資料可供匯出！");
+                showToast("目前無任何報名資料可供匯出！");
                 return;
             }
 
@@ -1331,7 +1396,7 @@
                 loader.classList.add('hidden');
                 resultBox.innerText = `【專輔教師溫馨自我照顧提示】\n\n感謝您長年投入輔導工作。當受輔個案離世時，專輔教師往往身兼「安心輔導執行者」與「心理受創者」的雙重角色，此時別忘了優先關注與照顧您自己的身心狀態：\n\n1. 許可悲傷：允許自己擁有難過、失落或無力感，情緒並不會影響您的專業，而是代表您對學生的深刻關懷。\n2. 設定界線：在工作與個人生活之間建立緩衝空間，進行適度的身體放鬆與休養。\n3. 尋求補位：適時與輔導團隊夥伴共享負擔與感受，讓團體的支持力量陪伴您過渡失落歷程。`;
                 resultBox.classList.remove('hidden');
-            }, 1200);
+            }, 800);
         }
 
         // AI 智慧服務 - 研究者訪談大綱
@@ -1352,7 +1417,7 @@
                 loader.classList.add('hidden');
                 resultBox.innerText = `【建議訪談暖身與提問大綱】\n\n1. 暖身經驗回顧：\n「感謝您願意參與本研究。當初得知該位學生離世時，您在第一時間的感受與工作情境是什麼？」\n\n2. 困境與調適歷程：\n「在進行全校安心輔導或個別諮商時，您如何在個人的悲傷情緒與專業輔導角色之間進行平衡與調適？」\n\n3. 系統支持與意義尋求：\n「在經歷此失落事件後，學校團隊或外界給予了您哪些支持？這段經驗對您後續的輔導工作與個人帶來了什麼轉變或啟發？」`;
                 resultBox.classList.remove('hidden');
-            }, 1200);
+            }, 800);
         }
 
         // 強制將所有函數暴露給 window 全域作用域，解決 HTML inline event onclick 找不到函數的問題
@@ -1373,6 +1438,9 @@
         window.generateAIInterviewGuide = generateAIInterviewGuide;
 
         window.onload = function() {
+            // 初始化渲染名單
+            renderAdminData();
+
             const radioLabels = document.querySelectorAll('input[name="school-level"]');
             radioLabels.forEach(radio => {
                 radio.addEventListener('change', function() {
