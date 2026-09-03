@@ -602,9 +602,9 @@
         </div>
     </div>
 
-    <!-- 刪除確認 Modal (取代原生 confirm，符合安全無阻規範) -->
-    <div id="delete-confirm-modal" class="hidden fixed inset-0 z-50 overflow-y-auto flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
-        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-xl border border-slate-100 transform transition-all-300 text-center">
+    <!-- 刪除確認 Modal (提升層級至最上層，確保覆蓋後台管理主控台) -->
+    <div id="delete-confirm-modal" class="hidden fixed inset-0 z-[70] overflow-y-auto flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4" style="z-index: 9999;">
+        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 transform transition-all-300 text-center">
             <div class="w-12 h-12 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center text-xl mx-auto mb-3 border border-rose-100">
                 <i class="fa-solid fa-trash-can"></i>
             </div>
@@ -778,6 +778,7 @@
         let isCloudAvailable = false;
         let lastSubmittedData = null; // 用於在成功畫面給 AI 快速讀取背景
         let pendingDeleteId = null; // 待刪除項目 ID
+        let pendingDeleteIndex = null; // 待刪除項目索引
 
         const apiKey = ""; 
 
@@ -1233,7 +1234,7 @@
             }
 
             placeholder.classList.add('hidden');
-            listContainer.innerHTML = registrants.map((reg) => {
+            listContainer.innerHTML = registrants.map((reg, index) => {
                 const contactMethodsBadge = (reg.contactMethods || []).map(m => 
                     `<span class="inline-block px-2 py-0.5 bg-emerald-50 text-emerald-700 text-[11px] rounded border border-emerald-200/50 mr-1">${m}</span>`
                 ).join('');
@@ -1265,7 +1266,7 @@
                                 <button onclick="viewRegDetails('${reg.id}')" class="px-2.5 py-1 bg-brand-100 text-brand-700 rounded text-xs hover:bg-brand-200 transition-all-300 font-medium">
                                     <i class="fa-solid fa-circle-info mr-0.5"></i>詳情
                                 </button>
-                                <button onclick="promptDeleteRegistrant('${reg.id}')" class="px-2.5 py-1 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded text-xs transition-all-300 font-medium border border-rose-200/60" title="刪除此筆資料">
+                                <button onclick="promptDeleteRegistrant('${reg.id || ''}', ${index})" class="px-2.5 py-1 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded text-xs transition-all-300 font-medium border border-rose-200/60 hover:border-rose-300" title="刪除此筆資料">
                                     <i class="fa-solid fa-trash-can mr-0.5"></i>刪除
                                 </button>
                             </div>
@@ -1276,32 +1277,53 @@
         }
 
         // 刪除操作邏輯
-        function promptDeleteRegistrant(id) {
-            const target = registrants.find(r => r.id === id);
-            if (!target) return;
-            pendingDeleteId = id;
+        function promptDeleteRegistrant(id, index) {
+            let target = registrants.find(r => r.id === id);
+            if (!target && typeof index === 'number' && registrants[index]) {
+                target = registrants[index];
+            }
+            if (!target) {
+                showToast("找不到欲刪除的資料紀錄！");
+                return;
+            }
+            pendingDeleteId = target.id || null;
+            pendingDeleteIndex = (typeof index === 'number') ? index : null;
+
             const nameEl = document.getElementById('delete-target-name');
             if (nameEl) nameEl.innerText = target.name || '該報名者';
-            document.getElementById('delete-confirm-modal')?.classList.remove('hidden');
+            
+            const modal = document.getElementById('delete-confirm-modal');
+            if (modal) {
+                modal.classList.remove('hidden');
+            }
         }
 
         function closeDeleteModal() {
             pendingDeleteId = null;
-            document.getElementById('delete-confirm-modal')?.classList.add('hidden');
+            pendingDeleteIndex = null;
+            const modal = document.getElementById('delete-confirm-modal');
+            if (modal) {
+                modal.classList.add('hidden');
+            }
         }
 
         async function executeDeleteRegistrant() {
-            if (!pendingDeleteId) return;
+            if (!pendingDeleteId && pendingDeleteIndex === null) return;
             const targetId = pendingDeleteId;
+            const targetIdx = pendingDeleteIndex;
             closeDeleteModal();
 
-            // 1. 本機資料庫刪除
-            registrants = registrants.filter(r => r.id !== targetId);
+            // 1. 本機資料庫刪除（支援 ID 與列表索引雙重比對）
+            if (targetId) {
+                registrants = registrants.filter(r => r.id !== targetId);
+            } else if (targetIdx !== null && targetIdx >= 0) {
+                registrants.splice(targetIdx, 1);
+            }
             saveLocalRegistrations(registrants);
             renderAdminData();
 
-            // 2. 雲端資料庫同步刪除（若已連線）
-            if (isCloudAvailable && currentUser && db) {
+            // 2. 雲端資料庫同步刪除（若已連線且非純前端暫存 ID）
+            if (isCloudAvailable && currentUser && db && targetId && !targetId.startsWith('mock_')) {
                 try {
                     const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'seminar-registration-app';
                     const docRef = doc(db, 'artifacts', currentAppId, 'public', 'data', 'registrations', targetId);
